@@ -1,23 +1,9 @@
 version: '3.8'
 
 services:
-  # 1. Tvůj stávající Cast MCP server (zůstává v network_mode: host kvůli mDNS)
-  cast-mcp:
+  cast-mcp-bridge:
     build: .
-    container_name: cast-mcp
+    container_name: cast-mcp-bridge
     restart: unless-stopped
+    # Stále klíčové pro mDNS objevování Chromecastů v LAN
     network_mode: host
-
-  # 2. Oficiální Open WebUI proxy, která transformuje stdio na HTTP
-  mcpo:
-    image: ghcr.io/open-webui/mcpo:main
-    container_name: mcpo
-    restart: unless-stopped
-    # Musí sdílet host síť, aby viděl na cast-mcp běžící na hostitelském stacku
-    network_mode: host
-    command: >
-      mcpo --port 8000 
-      --api-key "mYQmWl5oGtkchLsYmLZsvmbA4Q0f26mr" 
-      -- docker exec -i cast-mcp bunx -y @daanrongen/cast-mcp
-    depends_on:
-      - cast-mcp
