@@ -13,4 +13,4 @@ WORKDIR /app
 EXPOSE 8000
 
 # 3. Spuštění mcpo, které lokálně (uvnitř kontejneru) zavolá bunx cast-mcp přes stdio
-ENTRYPOINT ["/opt/venv/bin/mcpo", "--host", "0.0.0.0", "--port", "8000", "--api-key", "tvuj_silny_api_klic_zde", "--", "bunx", "-y", "@daanrongen/cast-mcp"]
+ENTRYPOINT ["/opt/venv/bin/mcpo", "--host", "0.0.0.0", "--port", "8000", "--api-key", "mYQmWl5oGtkchLsYmLZsvmbA4Q0f26mr", "--", "bunx", "-y", "@daanrongen/cast-mcp"]
