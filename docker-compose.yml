@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  cast-mcp:
+    build: .
+    container_name: cast-mcp
+    restart: unless-stopped
+    # Klíčové pro mDNS objevování Chromecastů v LAN
+    network_mode: host
+    # Volitelné: Pokud potřebuješ předat konfigurační env proměnné
+    environment:
+      - NODE_ENV=production
