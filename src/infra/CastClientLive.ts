@@ -59,6 +59,25 @@ const promisifyVoid = (fn: (cb: (err: Error | null) => void) => void): Promise<v
     });
   });
 
+// castv2-client does not time out callbacks when a receiver has already
+// closed its transport channel. Keep HTTP callers from waiting forever.
+const withTimeout = <T>(promise: Promise<T>, operation: string, timeoutMs = 15_000): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${operation} timed out`)), timeoutMs);
+    if (typeof timer.unref === "function") timer.unref();
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+
 // Connect a PlatformSender (castv2-client Client) to a Cast device.
 const connectPlatform = (
   host: string,
@@ -84,8 +103,12 @@ const launchReceiver = (
   // biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
 ): Effect.Effect<any, CastConnectionError> =>
   Effect.tryPromise({
-    // biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
-    try: () => promisify<any>((cb) => client.launch(DefaultMediaReceiver, cb)),
+    try: () =>
+      withTimeout(
+        // biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
+        promisify<any>((cb) => client.launch(DefaultMediaReceiver, cb)),
+        `launch DefaultMediaReceiver on ${host}`,
+      ),
     catch: (e) => new CastConnectionError({ host, cause: e }),
   });
 
@@ -144,7 +167,13 @@ export const CastClientLive = Layer.scoped(
         const conn = yield* getConn(host);
         if (conn.player) return conn;
 
-        conn.player = yield* launchReceiver(conn.client, host);
+        const player = yield* launchReceiver(conn.client, host);
+        conn.player = player;
+        // DefaultMediaReceiver can close independently after playback ends.
+        // Do not reuse that closed application controller on the next play request.
+        player.once("close", () => {
+          if (conn.player === player) conn.player = undefined;
+        });
         return conn;
       });
 
@@ -249,6 +278,43 @@ export const CastClientLive = Layer.scoped(
         );
       });
 
+    const loadMedia = (
+      // biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
+      player: any,
+      host: string,
+      contentUrl: string,
+      contentType: string,
+      metadata: object | undefined,
+    ) =>
+      Effect.tryPromise({
+        try: () =>
+          withTimeout(
+            new Promise<MediaStatus>((resolve, reject) => {
+              const media = {
+                contentId: contentUrl,
+                contentType,
+                streamType: "BUFFERED",
+                metadata: metadata ?? {},
+              };
+              player.load(
+                media,
+                { autoplay: true },
+                // biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
+                (err: Error | null, status: any) => {
+                  if (err) reject(err);
+                  else resolve(mediaStatusFrom(status));
+                },
+              );
+            }),
+            `load media on ${host}`,
+          ),
+        catch: (e) =>
+          new CastMediaError({
+            message: `playMedia on ${host} failed`,
+            cause: e,
+          }),
+      });
+
     return {
       discoverDevices: (timeoutMs = 5000) =>
         Effect.tryPromise({
@@ -348,31 +414,22 @@ export const CastClientLive = Layer.scoped(
       playMedia: (host, contentUrl, contentType, metadata) =>
         Effect.gen(function* () {
           const conn = yield* getPlayer(host);
-          return yield* Effect.tryPromise({
-            try: () =>
-              new Promise<MediaStatus>((resolve, reject) => {
-                const media = {
-                  contentId: contentUrl,
-                  contentType,
-                  streamType: "BUFFERED",
-                  metadata: metadata ?? {},
-                };
-                conn.player.load(
-                  media,
-                  { autoplay: true },
-                  // biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
-                  (err: Error | null, status: any) => {
-                    if (err) reject(err);
-                    else resolve(mediaStatusFrom(status));
-                  },
-                );
+          return yield* loadMedia(conn.player, host, contentUrl, contentType, metadata).pipe(
+            // A player can disappear without closing the platform socket. Retry once
+            // from a new socket/application instead of leaving the REST request pending.
+            Effect.catchAll(() =>
+              Effect.gen(function* () {
+                yield* evict(host, conn.client);
+                try {
+                  conn.client.close();
+                } catch {
+                  // Closing a stale client is best-effort.
+                }
+                const fresh = yield* getPlayer(host);
+                return yield* loadMedia(fresh.player, host, contentUrl, contentType, metadata);
               }),
-            catch: (e) =>
-              new CastMediaError({
-                message: `playMedia on ${host} failed`,
-                cause: e,
-              }),
-          });
+            ),
+          );
         }),
 
       pauseMedia: (host) =>
