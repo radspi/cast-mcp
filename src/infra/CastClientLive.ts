@@ -103,14 +103,19 @@ const mediaStatusFrom = (status: any): MediaStatus =>
 export const CastClientLive = Layer.scoped(
   CastClient,
   Effect.gen(function* () {
-    // Connection pool: host → { client (PlatformSender), player (DefaultMediaReceiver) }
+    // Connection pool: host → platform connection, with a media player created on demand.
+    // Receiver-only operations such as getStatus must not launch DefaultMediaReceiver:
+    // doing so visibly switches the TV to the blue Cast screen.
     const poolRef = yield* Ref.make<
       // biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
-      Map<string, { client: any; player: any }>
+      Map<string, { client: any; player?: any }>
     >(new Map());
 
-    const evict = (host: string) =>
+    // Do not let an event from an old socket evict a newer replacement connection.
+    // biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
+    const evict = (host: string, client?: any) =>
       Ref.update(poolRef, (m) => {
+        if (client && m.get(host)?.client !== client) return m;
         const next = new Map(m);
         next.delete(host);
         return next;
@@ -123,14 +128,23 @@ export const CastClientLive = Layer.scoped(
         if (existing) return existing;
 
         const client = yield* connectPlatform(host, port);
-        const player = yield* launchReceiver(client, host);
-        const conn = { client, player };
+        // biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
+        const conn: { client: any; player?: any } = { client };
         yield* Ref.update(poolRef, (m) => new Map(m).set(host, conn));
 
         // Evict dead connections so the next call reconnects automatically.
-        client.on("error", () => Effect.runFork(evict(host)));
-        client.on("close", () => Effect.runFork(evict(host)));
+        client.on("error", () => Effect.runFork(evict(host, client)));
+        client.on("close", () => Effect.runFork(evict(host, client)));
 
+        return conn;
+      });
+
+    const getPlayer = (host: string) =>
+      Effect.gen(function* () {
+        const conn = yield* getConn(host);
+        if (conn.player) return conn;
+
+        conn.player = yield* launchReceiver(conn.client, host);
         return conn;
       });
 
@@ -151,7 +165,7 @@ export const CastClientLive = Layer.scoped(
     // Shared implementation for queueNext (+1) and queuePrev (-1).
     const queueMove = (host: string, delta: 1 | -1) =>
       Effect.gen(function* () {
-        const conn = yield* getConn(host);
+        const conn = yield* getPlayer(host);
         yield* Effect.tryPromise({
           try: () =>
             new Promise<void>((resolve, reject) => {
@@ -181,39 +195,58 @@ export const CastClientLive = Layer.scoped(
         });
       });
 
+    // biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
+    const receiverStatus = (client: any, host: string) =>
+      Effect.tryPromise({
+        try: () =>
+          new Promise<ReceiverStatus>((resolve, reject) => {
+            client.getStatus(
+              // biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
+              (err: Error | null, status: any) => {
+                if (err) {
+                  reject(err);
+                  return;
+                }
+                resolve(
+                  new ReceiverStatus({
+                    volume: status?.volume?.level ?? 0.5,
+                    muted: status?.volume?.muted ?? false,
+                    applications: (status?.applications ?? []).map(
+                      // biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
+                      (app: any) =>
+                        new AppInfo({
+                          appId: app.appId,
+                          displayName: app.displayName,
+                          sessionId: app.sessionId,
+                        }),
+                    ),
+                  }),
+                );
+              },
+            );
+          }),
+        catch: (e) => new CastConnectionError({ host, cause: e }),
+      });
+
     const getStatus = (host: string) =>
       Effect.gen(function* () {
         const conn = yield* getConn(host);
-        return yield* Effect.tryPromise({
-          try: () =>
-            new Promise<ReceiverStatus>((resolve, reject) => {
-              conn.client.getStatus(
-                // biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
-                (err: Error | null, status: any) => {
-                  if (err) {
-                    reject(err);
-                    return;
-                  }
-                  resolve(
-                    new ReceiverStatus({
-                      volume: status?.volume?.level ?? 0.5,
-                      muted: status?.volume?.muted ?? false,
-                      applications: (status?.applications ?? []).map(
-                        // biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
-                        (app: any) =>
-                          new AppInfo({
-                            appId: app.appId,
-                            displayName: app.displayName,
-                            sessionId: app.sessionId,
-                          }),
-                      ),
-                    }),
-                  );
-                },
-              );
+        return yield* receiverStatus(conn.client, host).pipe(
+          // A Cast receiver can close an idle socket without emitting close/error
+          // before the next request. Drop that stale entry and retry once.
+          Effect.catchAll(() =>
+            Effect.gen(function* () {
+              yield* evict(host, conn.client);
+              try {
+                conn.client.close();
+              } catch {
+                // The connection is already unusable; the fresh connection below is enough.
+              }
+              const fresh = yield* getConn(host);
+              return yield* receiverStatus(fresh.client, host);
             }),
-          catch: (e) => new CastConnectionError({ host, cause: e }),
-        });
+          ),
+        );
       });
 
     return {
@@ -314,7 +347,7 @@ export const CastClientLive = Layer.scoped(
 
       playMedia: (host, contentUrl, contentType, metadata) =>
         Effect.gen(function* () {
-          const conn = yield* getConn(host);
+          const conn = yield* getPlayer(host);
           return yield* Effect.tryPromise({
             try: () =>
               new Promise<MediaStatus>((resolve, reject) => {
@@ -344,7 +377,7 @@ export const CastClientLive = Layer.scoped(
 
       pauseMedia: (host) =>
         Effect.gen(function* () {
-          const conn = yield* getConn(host);
+          const conn = yield* getPlayer(host);
           yield* Effect.tryPromise({
             try: () => promisifyVoid((cb) => conn.player.pause(cb)),
             catch: (e) =>
@@ -357,7 +390,7 @@ export const CastClientLive = Layer.scoped(
 
       resumeMedia: (host) =>
         Effect.gen(function* () {
-          const conn = yield* getConn(host);
+          const conn = yield* getPlayer(host);
           yield* Effect.tryPromise({
             try: () => promisifyVoid((cb) => conn.player.play(cb)),
             catch: (e) =>
@@ -370,7 +403,7 @@ export const CastClientLive = Layer.scoped(
 
       stopMedia: (host) =>
         Effect.gen(function* () {
-          const conn = yield* getConn(host);
+          const conn = yield* getPlayer(host);
           yield* Effect.tryPromise({
             try: () => promisifyVoid((cb) => conn.player.stop(cb)),
             catch: (e) =>
@@ -383,7 +416,7 @@ export const CastClientLive = Layer.scoped(
 
       seekMedia: (host, currentTime) =>
         Effect.gen(function* () {
-          const conn = yield* getConn(host);
+          const conn = yield* getPlayer(host);
           yield* Effect.tryPromise({
             try: () => promisifyVoid((cb) => conn.player.seek(currentTime, cb)),
             catch: (e) =>
@@ -396,7 +429,7 @@ export const CastClientLive = Layer.scoped(
 
       getMediaStatus: (host) =>
         Effect.gen(function* () {
-          const conn = yield* getConn(host);
+          const conn = yield* getPlayer(host);
           return yield* Effect.tryPromise({
             try: () =>
               new Promise<MediaStatus>((resolve, reject) => {
@@ -492,7 +525,7 @@ export const CastClientLive = Layer.scoped(
 
       stopApp: (host) =>
         Effect.gen(function* () {
-          const conn = yield* getConn(host);
+          const conn = yield* getPlayer(host);
           yield* Effect.tryPromise({
             try: () => promisifyVoid((cb) => conn.client.stop(conn.player, cb)),
             catch: (e) => new CastConnectionError({ host, cause: e }),
@@ -501,7 +534,7 @@ export const CastClientLive = Layer.scoped(
 
       loadQueue: (host, items: QueueItem[]) =>
         Effect.gen(function* () {
-          const conn = yield* getConn(host);
+          const conn = yield* getPlayer(host);
           yield* Effect.tryPromise({
             try: () => {
               const queueItems = items.map((item) => ({
