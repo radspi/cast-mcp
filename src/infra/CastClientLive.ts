@@ -558,6 +558,7 @@ export const CastClientLive = Layer.scoped(
       stopMedia: (host) =>
         Effect.gen(function* () {
           const conn = yield* getPlayer(host);
+
           yield* Effect.tryPromise({
             try: () => promisifyVoid((cb) => conn.player.stop(cb)),
             catch: (e) =>
@@ -565,7 +566,15 @@ export const CastClientLive = Layer.scoped(
                 message: `stopMedia on ${host} failed`,
                 cause: e,
               }),
-          });
+          }).pipe(
+            // Pokud stop selže (např. nic nehrajeme), potlačíme chybu a vrátíme void
+            Effect.catchAll((err) =>
+              // Lze popřípadě vyfiltrovat podle typu/obsahu chyby z castv2
+              Effect.logDebug(`stopMedia call ignored on ${host}: ${err.message}`).pipe(
+                Effect.asVoid,
+              ),
+            ),
+          );
         }),
 
       seekMedia: (host, currentTime) =>
