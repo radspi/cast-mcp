@@ -561,7 +561,7 @@ export const CastClientLive = Layer.scoped(
 
           const conn = yield* getConn(host);
 
-          // 1. Pokud máme v poolu žijící player, zkusíme stop nad ním
+          // 1. Zkusíme použít kešovaný player, pokud existuje a žije
           if (conn.player && isPlayerAlive(conn.player)) {
             console.error(
               `[stopMedia] Active player instance found for ${host}. Executing player.stop()`,
@@ -569,7 +569,11 @@ export const CastClientLive = Layer.scoped(
 
             const stopped = yield* Effect.tryPromise({
               try: () => promisifyVoid((cb) => conn.player.stop(cb)),
-              catch: (e) => e,
+              catch: (e) =>
+                new CastMediaError({
+                  message: `stopMedia on ${host} failed: ${e instanceof Error ? e.message : String(e)}`,
+                  cause: e,
+                }),
             }).pipe(
               Effect.map(() => true),
               Effect.catchAll((err) => {
@@ -584,41 +588,55 @@ export const CastClientLive = Layer.scoped(
             }
           }
 
-          // 2. Načteme stav receiveru
-          console.error(`[stopMedia] Fetching receiver status from ${host}...`);
-          const recStatus = yield* receiverStatus(conn.client, host).pipe(
+          // 2. Načteme RAW stav z receiveru bez vracení 'null' do chybového kanálu
+          console.error(`[stopMedia] Fetching raw receiver status from ${host}...`);
+          // biome-ignore lint/suspicious/noExplicitAny: castv2-client raw response
+          const status = yield* Effect.tryPromise<any, CastConnectionError>({
+            try: () =>
+              new Promise((resolve, reject) => {
+                // biome-ignore lint/suspicious/noExplicitAny: castv2-client raw response
+                conn.client.getStatus((err: Error | null, res: any) => {
+                  if (err) reject(err);
+                  else resolve(res);
+                });
+              }),
+            catch: (err) => new CastConnectionError({ host, cause: err }),
+          }).pipe(
             Effect.catchAll((err) => {
               console.error(`[stopMedia] Failed to get receiver status:`, err);
-              return Effect.succeed(null);
+              // Při chybě načtení statusu pokračujeme s prázdným stavem (úspěšná hodnota undefined)
+              return Effect.succeed(undefined);
             }),
           );
 
-          const activeApp = recStatus?.applications?.[0];
-          console.error(`[stopMedia] Active app raw data:`, JSON.stringify(activeApp ?? null));
+          const rawApp = status?.applications?.[0];
+          console.error(`[stopMedia] Active app raw data:`, JSON.stringify(rawApp ?? null));
 
-          if (!activeApp || activeApp.appId === "E8C28D3C") {
-            console.error(`[stopMedia] No media application running on ${host}. Exiting.`);
+          if (!rawApp || rawApp.appId === "E8C28D3C") {
+            console.error(`[stopMedia] No active media app running on ${host}. Exiting.`);
             return;
           }
 
-          // 3. Pokus o JOIN nebo direct receiver STOP
-          console.error(`[stopMedia] Attempting client.join for sessionId: ${activeApp.sessionId}`);
+          // 3. PŘIPOJENÍ přes originální rawApp objekt (obsahuje transportId)
+          console.error(
+            `[stopMedia] Attempting client.join with transportId: ${rawApp.transportId}`,
+          );
 
-          yield* Effect.tryPromise({
+          yield* Effect.tryPromise<void, CastMediaError>({
             try: () =>
               new Promise<void>((resolve, reject) => {
                 conn.client.join(
-                  activeApp,
+                  rawApp,
                   DefaultMediaReceiver,
-                  // biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
+                  // biome-ignore lint/suspicious/noExplicitAny: castv2-client raw response
                   (err: Error | null, joinedPlayer: any) => {
                     if (err) {
-                      console.error(`[stopMedia] client.join() failed with error:`, err);
+                      console.error(`[stopMedia] client.join() failed:`, err);
                       console.error(
-                        `[stopMedia] Running fallback: client.stop(sessionId) for ${activeApp.sessionId}`,
+                        `[stopMedia] Fallback to client.stop(sessionId: ${rawApp.sessionId})`,
                       );
 
-                      conn.client.stop(activeApp.sessionId, (stopErr: Error | null) => {
+                      conn.client.stop(rawApp.sessionId, (stopErr: Error | null) => {
                         if (stopErr) {
                           console.error(`[stopMedia] Fallback client.stop() failed:`, stopErr);
                           reject(stopErr);
