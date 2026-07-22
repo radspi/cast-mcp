@@ -561,12 +561,65 @@ export const CastClientLive = Layer.scoped(
 
           const conn = yield* getConn(host);
 
-          // 1. Zkusíme použít kešovaný player, pokud existuje a má platnou mediaSession
-          if (conn.player && isPlayerAlive(conn.player)) {
-            console.error(
-              `[stopMedia] Active player instance found for ${host}. Executing player.stop()`,
-            );
+          // Helper pro natvrdo vypnutí aplikace přes receiver API, pokud média nejdou stopnout
+          const stopApplicationFallback = (sessionId: string) =>
+            new Promise<void>((resolve, reject) => {
+              console.error(
+                `[stopMedia] Fallback: Stopping app via receiver sessionId: ${sessionId}`,
+              );
+              conn.client.stop(sessionId, (stopErr: Error | null) => {
+                if (stopErr) {
+                  console.error(`[stopMedia] Receiver client.stop() failed:`, stopErr);
+                  reject(stopErr);
+                } else {
+                  console.error(`[stopMedia] Receiver client.stop() succeeded.`);
+                  conn.player = undefined;
+                  resolve();
+                }
+              });
+            });
 
+          // Helper pro bezpečný stop nad platnou mediaSession
+          // biome-ignore lint/suspicious/noExplicitAny: castv2-client raw player
+          const safeStopMedia = (player: any, sessionId: string) =>
+            new Promise<void>((resolve, reject) => {
+              console.error(`[stopMedia] Fetching media status to populate currentSession...`);
+
+              // 1. Zjistíme stav média pro získání mediaSessionId
+              // biome-ignore lint/suspicious/noExplicitAny: castv2-client raw status
+              player.getStatus((statusErr: Error | null, status: any) => {
+                // mediaSessionId může být buď přímo v player.currentSession nebo ve vráceném statusu
+                const mediaSessionId =
+                  player.media?.currentSession?.mediaSessionId ??
+                  status?.mediaSessionId ??
+                  status?.[0]?.mediaSessionId;
+
+                if (statusErr || !mediaSessionId) {
+                  console.error(
+                    `[stopMedia] No active mediaSessionId found (err: ${statusErr?.message}). Falling back to app stop.`,
+                  );
+                  stopApplicationFallback(sessionId).then(resolve, reject);
+                  return;
+                }
+
+                console.error(
+                  `[stopMedia] Sending STOP payload for mediaSessionId: ${mediaSessionId}`,
+                );
+
+                // 2. Pošleme přímou STOP zprávu na media controller channel
+                player.media.send({
+                  type: "STOP",
+                  mediaSessionId,
+                });
+
+                conn.player = undefined;
+                resolve();
+              });
+            });
+
+          // 1. Pokud máme v keši žijící player a má načtenou session
+          if (conn.player && isPlayerAlive(conn.player) && conn.player.media?.currentSession) {
+            console.error(`[stopMedia] Executing stop on cached alive player`);
             const stopped = yield* Effect.tryPromise({
               try: () => promisifyVoid((cb) => conn.player.stop(cb)),
               catch: (e) => e,
@@ -584,7 +637,7 @@ export const CastClientLive = Layer.scoped(
             }
           }
 
-          // 2. Načteme RAW stav receiveru
+          // 2. Načteme stav receiveru
           console.error(`[stopMedia] Fetching raw receiver status from ${host}...`);
           // biome-ignore lint/suspicious/noExplicitAny: castv2-client raw response
           const status = yield* Effect.tryPromise<any, CastConnectionError>({
@@ -612,25 +665,7 @@ export const CastClientLive = Layer.scoped(
             return;
           }
 
-          // Helper pro natvrdo vypnutí aplikace na receiveru
-          const stopApplicationFallback = (sessionId: string) =>
-            new Promise<void>((resolve, reject) => {
-              console.error(
-                `[stopMedia] Stopping application directly via receiver sessionId: ${sessionId}`,
-              );
-              conn.client.stop(sessionId, (stopErr: Error | null) => {
-                if (stopErr) {
-                  console.error(`[stopMedia] Receiver client.stop() failed:`, stopErr);
-                  reject(stopErr);
-                } else {
-                  console.error(`[stopMedia] Receiver client.stop() succeeded.`);
-                  conn.player = undefined;
-                  resolve();
-                }
-              });
-            });
-
-          // 3. PŘIPOJENÍ k aplikaci (join)
+          // 3. Připojení k běžící aplikaci a odeslání STOP
           console.error(
             `[stopMedia] Attempting client.join with transportId: ${rawApp.transportId}`,
           );
@@ -649,39 +684,10 @@ export const CastClientLive = Layer.scoped(
                       return;
                     }
 
-                    console.error(
-                      `[stopMedia] Joined session. Fetching media status to populate currentSession...`,
-                    );
+                    console.error(`[stopMedia] Joined session successfully.`);
                     attachPlayer(conn, joinedPlayer);
 
-                    // PŘED stopMedia JE NUTNÉ ZAVOLAT getStatus(), aby se v joinedPlayer vytvořil currentSession
-                    // biome-ignore lint/suspicious/noExplicitAny: castv2-client raw response
-                    joinedPlayer.getStatus((statusErr: Error | null, mediaStatus: any) => {
-                      if (statusErr || !joinedPlayer.currentSession) {
-                        console.error(
-                          `[stopMedia] joinedPlayer.getStatus() failed or no media session found. Fallback to client.stop()`,
-                          statusErr,
-                        );
-                        stopApplicationFallback(rawApp.sessionId).then(resolve, reject);
-                        return;
-                      }
-
-                      console.error(
-                        `[stopMedia] Media status received (mediaSessionId: ${joinedPlayer.currentSession.mediaSessionId}). Executing stop()`,
-                      );
-
-                      joinedPlayer.stop((stopErr: Error | null) => {
-                        if (stopErr) {
-                          console.error(`[stopMedia] joinedPlayer.stop() failed:`, stopErr);
-                          // Pokud selže i stop na media channelu, dorazíme to přes receiver stop
-                          stopApplicationFallback(rawApp.sessionId).then(resolve, reject);
-                        } else {
-                          console.error(`[stopMedia] joinedPlayer.stop() succeeded.`);
-                          conn.player = undefined;
-                          resolve();
-                        }
-                      });
-                    });
+                    safeStopMedia(joinedPlayer, rawApp.sessionId).then(resolve, reject);
                   },
                 );
               }),
