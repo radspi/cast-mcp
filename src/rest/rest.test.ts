@@ -93,6 +93,41 @@ describe("REST API HTTP Server", () => {
     expect(body.result.playerState).toBe("PLAYING");
   });
 
+  it("POST /api/tools/play_media handles back-to-back calls without hanging", async () => {
+    const payload = {
+      host: "192.168.1.50",
+      contentUrl: "http://example.com/audio.mp3",
+      contentType: "audio/mp3",
+    };
+
+    const first = await handler(
+      new Request("http://localhost/api/tools/play_media", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }),
+    );
+    const second = await handler(
+      new Request("http://localhost/api/tools/play_media", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...payload,
+          contentUrl: "http://example.com/other.mp3",
+        }),
+      }),
+    );
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    const firstBody = (await first.json()) as { ok: boolean; result: { playerState: string } };
+    const secondBody = (await second.json()) as { ok: boolean; result: { playerState: string } };
+    expect(firstBody.ok).toBe(true);
+    expect(secondBody.ok).toBe(true);
+    expect(firstBody.result.playerState).toBe("PLAYING");
+    expect(secondBody.result.playerState).toBe("PLAYING");
+  });
+
   it("POST /api/tools/set_volume executes set_volume tool", async () => {
     const req = new Request("http://localhost/api/tools/set_volume", {
       method: "POST",

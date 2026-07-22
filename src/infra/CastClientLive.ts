@@ -1,4 +1,4 @@
-import { Effect, Layer, Ref } from "effect";
+import { Deferred, Effect, Layer, Ref } from "effect";
 import MulticastDNS from "multicast-dns";
 import { CastClient } from "../domain/CastClient.ts";
 import { CastConnectionError, CastMediaError } from "../domain/errors.ts";
@@ -123,16 +123,47 @@ const mediaStatusFrom = (status: any): MediaStatus =>
     albumName: status?.media?.metadata?.albumName,
   });
 
+// biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
+type CastConn = { client: any; player?: any };
+
+// biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
+const isPlayerAlive = (player: any): boolean => player?.connection != null && player?.media != null;
+
 export const CastClientLive = Layer.scoped(
   CastClient,
   Effect.gen(function* () {
     // Connection pool: host → platform connection, with a media player created on demand.
     // Receiver-only operations such as getStatus must not launch DefaultMediaReceiver:
     // doing so visibly switches the TV to the blue Cast screen.
-    const poolRef = yield* Ref.make<
-      // biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
-      Map<string, { client: any; player?: any }>
+    const poolRef = yield* Ref.make<Map<string, CastConn>>(new Map());
+
+    // Serialize per-host Cast operations so overlapping REST calls do not race on connect/launch.
+    const hostTurnRef = yield* Ref.make<Map<string, Deferred.Deferred<void, never>>>(new Map());
+
+    // Deduplicate in-flight platform connects and receiver launches for the same host.
+    const connInFlightRef = yield* Ref.make<
+      Map<string, Deferred.Deferred<CastConn, CastConnectionError>>
     >(new Map());
+    const playerInFlightRef = yield* Ref.make<
+      Map<string, Deferred.Deferred<void, CastConnectionError>>
+    >(new Map());
+
+    const withHostSerial = <A, E, R>(host: string, effect: Effect.Effect<A, E, R>) =>
+      Effect.gen(function* () {
+        const myTurn = yield* Deferred.make<void, never>();
+        const prevTurn = yield* Ref.modify(hostTurnRef, (turns) => {
+          const prev = turns.get(host);
+          const next = new Map(turns);
+          next.set(host, myTurn);
+          return [prev, next] as const;
+        });
+
+        if (prevTurn) {
+          yield* Deferred.await(prevTurn);
+        }
+
+        return yield* effect.pipe(Effect.ensuring(Deferred.succeed(myTurn, void 0)));
+      });
 
     // Do not let an event from an old socket evict a newer replacement connection.
     // biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
@@ -144,15 +175,9 @@ export const CastClientLive = Layer.scoped(
         return next;
       });
 
-    const getConn = (host: string, port = 8009) =>
+    const registerConn = (host: string, client: CastConn["client"]) =>
       Effect.gen(function* () {
-        const pool = yield* Ref.get(poolRef);
-        const existing = pool.get(host);
-        if (existing) return existing;
-
-        const client = yield* connectPlatform(host, port);
-        // biome-ignore lint/suspicious/noExplicitAny: castv2-client has no type definitions
-        const conn: { client: any; player?: any } = { client };
+        const conn: CastConn = { client };
         yield* Ref.update(poolRef, (m) => new Map(m).set(host, conn));
 
         // Evict dead connections so the next call reconnects automatically.
@@ -162,18 +187,80 @@ export const CastClientLive = Layer.scoped(
         return conn;
       });
 
+    const connectAndRegister = (host: string, port = 8009) =>
+      Effect.gen(function* () {
+        const client = yield* connectPlatform(host, port);
+        return yield* registerConn(host, client);
+      });
+
+    const getConn = (host: string, port = 8009) =>
+      Effect.gen(function* () {
+        const pool = yield* Ref.get(poolRef);
+        const existing = pool.get(host);
+        if (existing) return existing;
+
+        const inFlight = yield* Ref.get(connInFlightRef);
+        const pending = inFlight.get(host);
+        if (pending) return yield* Deferred.await(pending);
+
+        const gate = yield* Deferred.make<CastConn, CastConnectionError>();
+        yield* Ref.update(connInFlightRef, (m) => new Map(m).set(host, gate));
+
+        return yield* connectAndRegister(host, port).pipe(
+          Effect.tap((conn) => Deferred.succeed(gate, conn)),
+          Effect.tapError((e) => Deferred.fail(gate, e)),
+          Effect.ensuring(
+            Ref.update(connInFlightRef, (m) => {
+              const next = new Map(m);
+              next.delete(host);
+              return next;
+            }),
+          ),
+        );
+      });
+
+    const attachPlayer = (conn: CastConn, player: CastConn["player"]) => {
+      conn.player = player;
+      player.once("close", () => {
+        if (conn.player === player) conn.player = undefined;
+      });
+      return player;
+    };
+
+    const launchAndAttach = (conn: CastConn, host: string) =>
+      Effect.gen(function* () {
+        const player = yield* launchReceiver(conn.client, host);
+        return attachPlayer(conn, player);
+      });
+
     const getPlayer = (host: string) =>
       Effect.gen(function* () {
         const conn = yield* getConn(host);
-        if (conn.player) return conn;
+        if (conn.player && isPlayerAlive(conn.player)) return conn;
+        if (conn.player) conn.player = undefined;
 
-        const player = yield* launchReceiver(conn.client, host);
-        conn.player = player;
-        // DefaultMediaReceiver can close independently after playback ends.
-        // Do not reuse that closed application controller on the next play request.
-        player.once("close", () => {
-          if (conn.player === player) conn.player = undefined;
-        });
+        const inFlight = yield* Ref.get(playerInFlightRef);
+        const pending = inFlight.get(host);
+        if (pending) {
+          yield* Deferred.await(pending);
+          return conn;
+        }
+
+        const gate = yield* Deferred.make<void, CastConnectionError>();
+        yield* Ref.update(playerInFlightRef, (m) => new Map(m).set(host, gate));
+
+        yield* launchAndAttach(conn, host).pipe(
+          Effect.tap(() => Deferred.succeed(gate, void 0)),
+          Effect.tapError((e) => Deferred.fail(gate, e)),
+          Effect.ensuring(
+            Ref.update(playerInFlightRef, (m) => {
+              const next = new Map(m);
+              next.delete(host);
+              return next;
+            }),
+          ),
+        );
+
         return conn;
       });
 
@@ -412,25 +499,35 @@ export const CastClientLive = Layer.scoped(
       getStatus,
 
       playMedia: (host, contentUrl, contentType, metadata) =>
-        Effect.gen(function* () {
-          const conn = yield* getPlayer(host);
-          return yield* loadMedia(conn.player, host, contentUrl, contentType, metadata).pipe(
-            // A player can disappear without closing the platform socket. Retry once
-            // from a new socket/application instead of leaving the REST request pending.
-            Effect.catchAll(() =>
+        withHostSerial(
+          host,
+          Effect.gen(function* () {
+            const tryLoad = (conn: CastConn) =>
               Effect.gen(function* () {
-                yield* evict(host, conn.client);
-                try {
-                  conn.client.close();
-                } catch {
-                  // Closing a stale client is best-effort.
-                }
-                const fresh = yield* getPlayer(host);
-                return yield* loadMedia(fresh.player, host, contentUrl, contentType, metadata);
-              }),
-            ),
-          );
-        }),
+                // Re-join the DefaultMediaReceiver session on every play request.
+                // Reusing a cached player leaves load() waiting on a dead media channel.
+                const player = yield* launchAndAttach(conn, host);
+                return yield* loadMedia(player, host, contentUrl, contentType, metadata);
+              });
+
+            const conn = yield* getConn(host);
+            return yield* tryLoad(conn).pipe(
+              Effect.catchAll(() =>
+                Effect.gen(function* () {
+                  yield* evict(host, conn.client);
+                  try {
+                    conn.client.close();
+                  } catch {
+                    // Closing a stale client is best-effort.
+                  }
+                  conn.player = undefined;
+                  const fresh = yield* getConn(host);
+                  return yield* tryLoad(fresh);
+                }),
+              ),
+            );
+          }),
+        ),
 
       pauseMedia: (host) =>
         Effect.gen(function* () {
