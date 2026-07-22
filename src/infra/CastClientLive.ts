@@ -557,8 +557,27 @@ export const CastClientLive = Layer.scoped(
 
       stopMedia: (host) =>
         Effect.gen(function* () {
-          const conn = yield* getPlayer(host);
+          const conn = yield* getConn(host);
 
+          // Pokud player neexistuje nebo není živej, nebudeme ho LAUNCHAT (to by spustilo novou appku!),
+          // ale rovněž zastavíme aplikaci přes receiver client.
+          if (!conn.player || !isPlayerAlive(conn.player)) {
+            // Můžeme zavolat stopApp / receiver stop
+            const status = yield* receiverStatus(conn.client, host).pipe(
+              Effect.catchAll(() => Effect.succeed(null)),
+            );
+            const appId = status?.applications?.[0]?.sessionId;
+            if (appId) {
+              yield* Effect.tryPromise({
+                try: () => promisifyVoid((cb) => conn.client.stop(appId, cb)),
+                catch: (e) =>
+                  new CastMediaError({ message: `stopMedia on ${host} failed`, cause: e }),
+              }).pipe(Effect.catchAll(() => Effect.void));
+            }
+            return;
+          }
+
+          // Pokud spojení na player žije, pošleme stop normálně
           yield* Effect.tryPromise({
             try: () => promisifyVoid((cb) => conn.player.stop(cb)),
             catch: (e) =>
@@ -566,15 +585,7 @@ export const CastClientLive = Layer.scoped(
                 message: `stopMedia on ${host} failed`,
                 cause: e,
               }),
-          }).pipe(
-            // Pokud stop selže (např. nic nehrajeme), potlačíme chybu a vrátíme void
-            Effect.catchAll((err) =>
-              // Lze popřípadě vyfiltrovat podle typu/obsahu chyby z castv2
-              Effect.logDebug(`stopMedia call ignored on ${host}: ${err.message}`).pipe(
-                Effect.asVoid,
-              ),
-            ),
-          );
+          });
         }),
 
       seekMedia: (host, currentTime) =>
