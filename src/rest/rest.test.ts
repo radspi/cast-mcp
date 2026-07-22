@@ -55,6 +55,16 @@ describe("REST API HTTP Server", () => {
     expect(html).toContain("/openapi.json");
   });
 
+  it("GET /health returns a healthy status payload", async () => {
+    const req = new Request("http://localhost/health");
+    const res = await handler(req);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toBe("application/json");
+    const body = (await res.json()) as { ok: boolean; status: string };
+    expect(body.ok).toBe(true);
+    expect(body.status).toBe("ok");
+  });
+
   it("GET /api/tools lists all 17 registered tools with metadata", async () => {
     const req = new Request("http://localhost/api/tools");
     const res = await handler(req);

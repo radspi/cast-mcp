@@ -67,6 +67,14 @@ export function createRestHandler(runtime: ManagedRuntime.ManagedRuntime<CastCli
       return new Response(null, { status: 204, headers });
     }
 
+    // GET /health for health checks
+    if (method === "GET" && pathname === "/health") {
+      return new Response(JSON.stringify({ ok: true, status: "ok" }), {
+        status: 200,
+        headers: { ...headers, "Content-Type": "application/json" },
+      });
+    }
+
     // GET /openapi.json or /api/docs/openapi.json
     if (
       method === "GET" &&
