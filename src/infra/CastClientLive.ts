@@ -557,29 +557,124 @@ export const CastClientLive = Layer.scoped(
 
       stopMedia: (host) =>
         Effect.gen(function* () {
+          yield* Effect.logDebug(`[stopMedia] Starting stop operation for host: ${host}`);
+
           const conn = yield* getConn(host);
 
-          // Pokud player neexistuje nebo není živej, nebudeme ho LAUNCHAT (to by spustilo novou appku!),
-          // ale rovněž zastavíme aplikaci přes receiver client.
-          if (!conn.player || !isPlayerAlive(conn.player)) {
-            // Můžeme zavolat stopApp / receiver stop
-            const status = yield* receiverStatus(conn.client, host).pipe(
-              Effect.catchAll(() => Effect.succeed(null)),
+          // 1. Zkusíme použít existující vnitřní player, pokud žije
+          if (conn.player && isPlayerAlive(conn.player)) {
+            yield* Effect.logDebug(
+              `[stopMedia] Active player instance found in pool for ${host}. Sending player.stop()`,
             );
-            const appId = status?.applications?.[0]?.sessionId;
-            if (appId) {
-              yield* Effect.tryPromise({
-                try: () => promisifyVoid((cb) => conn.client.stop(appId, cb)),
-                catch: (e) =>
-                  new CastMediaError({ message: `stopMedia on ${host} failed`, cause: e }),
-              }).pipe(Effect.catchAll(() => Effect.void));
+
+            const stopped = yield* Effect.tryPromise({
+              try: () => promisifyVoid((cb) => conn.player.stop(cb)),
+              catch: (e) => e,
+            }).pipe(
+              Effect.map(() => true),
+              Effect.catchAll((err) =>
+                Effect.logDebug(`[stopMedia] Active player.stop() failed: ${err}`).pipe(
+                  Effect.map(() => false),
+                ),
+              ),
+            );
+
+            if (stopped) {
+              yield* Effect.logDebug(
+                `[stopMedia] Successfully stopped media via cached player instance on ${host}`,
+              );
+              return;
             }
+          } else {
+            yield* Effect.logDebug(`[stopMedia] No active cached player found for ${host}`);
+          }
+
+          // 2. Načteme aktuální stav receiveru
+          yield* Effect.logDebug(`[stopMedia] Fetching receiver status from ${host}...`);
+          const recStatus = yield* receiverStatus(conn.client, host).pipe(
+            Effect.tap((status) =>
+              Effect.logDebug(
+                `[stopMedia] Receiver status fetched. Applications count: ${status?.applications?.length ?? 0}`,
+              ),
+            ),
+            Effect.catchAll((err) =>
+              Effect.logDebug(`[stopMedia] Failed to get receiver status: ${err}`).pipe(
+                Effect.map(() => null),
+              ),
+            ),
+          );
+
+          const activeApp = recStatus?.applications?.[0];
+
+          if (!activeApp) {
+            yield* Effect.logDebug(
+              `[stopMedia] No active application running on ${host}. Nothing to stop.`,
+            );
             return;
           }
 
-          // Pokud spojení na player žije, pošleme stop normálně
+          yield* Effect.logDebug(
+            `[stopMedia] Found active app on ${host}: ${activeApp.displayName} (appId: ${activeApp.appId}, sessionId: ${activeApp.sessionId})`,
+          );
+
+          // Pokud je aktivní jen výchozí systémový Backdrop (screensaver)
+          if (activeApp.appId === "E8C28D3C") {
+            yield* Effect.logDebug(
+              `[stopMedia] Active app is system Backdrop (E8C28D3C). Skipping stop.`,
+            );
+            return;
+          }
+
+          // 3. Pokusíme se o JOIN k běžící relaci a odeslání stop
+          yield* Effect.logDebug(
+            `[stopMedia] Attempting client.join() to sessionId: ${activeApp.sessionId}`,
+          );
+
           yield* Effect.tryPromise({
-            try: () => promisifyVoid((cb) => conn.player.stop(cb)),
+            try: () =>
+              new Promise<void>((resolve, reject) => {
+                conn.client.join(
+                  activeApp,
+                  DefaultMediaReceiver,
+                  (err: Error | null, joinedPlayer: any) => {
+                    if (err) {
+                      // Pokud JOIN selže (např. appka nemá media rozhraní), stopneme ji celou na úrovni receiveru
+                      // biome-ignore lint/suspicious/noExplicitAny: castv2 callback error typing
+                      const errMsg = (err as any)?.message ?? String(err);
+                      console.debug(
+                        `[stopMedia] client.join() failed (${errMsg}). Fallback to client.stop(sessionId)`,
+                      );
+
+                      conn.client.stop(activeApp.sessionId, (stopErr: Error | null) => {
+                        if (stopErr) {
+                          reject(stopErr);
+                        } else {
+                          console.debug(
+                            `[stopMedia] Successfully stopped application ${activeApp.sessionId} via receiver fallback`,
+                          );
+                          resolve();
+                        }
+                      });
+                      return;
+                    }
+
+                    console.debug(
+                      `[stopMedia] Successfully joined media session. Sending joinedPlayer.stop()`,
+                    );
+                    attachPlayer(conn, joinedPlayer);
+
+                    joinedPlayer.stop((stopErr: Error | null) => {
+                      if (stopErr) {
+                        console.debug(`[stopMedia] joinedPlayer.stop() failed: ${stopErr.message}`);
+                        reject(stopErr);
+                      } else {
+                        console.debug(`[stopMedia] joinedPlayer.stop() succeeded`);
+                        resolve();
+                      }
+                    });
+                  },
+                );
+              }),
             catch: (e) =>
               new CastMediaError({
                 message: `stopMedia on ${host} failed`,
