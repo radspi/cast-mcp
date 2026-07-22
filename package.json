@@ -16,7 +16,7 @@
     "dist"
   ],
   "scripts": {
-    "dev": "bun --watch src/main.ts",
+    "dev": "bun --watch src/main.ts --rest 3334",
     "inspect": "DANGEROUSLY_OMIT_AUTH=true mcp-inspector bun src/main.ts",
     "build": "bun build src/main.ts --outfile dist/main.js --target bun --external castv2 --external castv2-client --external multicast-dns",
     "typecheck": "tsc -p tsconfig.check.json",

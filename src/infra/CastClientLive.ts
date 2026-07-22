@@ -177,6 +177,11 @@ export const CastClientLive = Layer.scoped(
 
     const registerConn = (host: string, client: CastConn["client"]) =>
       Effect.gen(function* () {
+        // Vypneme varování pro hromadění listenerů na dlouhožijícím socketu
+        if (typeof client.setMaxListeners === "function") {
+          client.setMaxListeners(0); // 0 = neomezeně
+        }
+
         const conn: CastConn = { client };
         yield* Ref.update(poolRef, (m) => new Map(m).set(host, conn));
 
@@ -220,6 +225,15 @@ export const CastClientLive = Layer.scoped(
       });
 
     const attachPlayer = (conn: CastConn, player: CastConn["player"]) => {
+      // Pokud v konektoru už visel starý player, uzavřeme jeho kanály
+      if (conn.player && conn.player !== player) {
+        try {
+          conn.player.close();
+        } catch {
+          // ignore teardown errors
+        }
+      }
+
       conn.player = player;
       player.once("close", () => {
         if (conn.player === player) conn.player = undefined;
@@ -533,26 +547,88 @@ export const CastClientLive = Layer.scoped(
         Effect.gen(function* () {
           const conn = yield* getPlayer(host);
           yield* Effect.tryPromise({
-            try: () => promisifyVoid((cb) => conn.player.pause(cb)),
+            try: () =>
+              withTimeout(
+                new Promise<void>((resolve, reject) => {
+                  const executePause = () => {
+                    conn.player.pause((err: Error | null) => {
+                      if (err) reject(err);
+                      else resolve();
+                    });
+                  };
+
+                  try {
+                    executePause();
+                  } catch {
+                    conn.player.getStatus((statusErr: Error | null) => {
+                      if (statusErr) {
+                        reject(statusErr);
+                        return;
+                      }
+                      try {
+                        executePause();
+                      } catch (retryErr) {
+                        reject(retryErr);
+                      }
+                    });
+                  }
+                }),
+                `pauseMedia on ${host}`,
+                5000, // 5s timeout zabrání zamrznutí
+              ),
             catch: (e) =>
               new CastMediaError({
-                message: `pauseMedia on ${host} failed`,
+                message: `pauseMedia on ${host} failed: ${e instanceof Error ? e.message : String(e)}`,
                 cause: e,
               }),
-          });
+          }).pipe(
+            // Pokud spojení spadlo (zombie socket), odstraňme ho z poolu
+            Effect.tapError(() => evict(host, conn.client)),
+          );
         }),
 
       resumeMedia: (host) =>
         Effect.gen(function* () {
           const conn = yield* getPlayer(host);
           yield* Effect.tryPromise({
-            try: () => promisifyVoid((cb) => conn.player.play(cb)),
+            try: () =>
+              withTimeout(
+                new Promise<void>((resolve, reject) => {
+                  const executePlay = () => {
+                    conn.player.play((err: Error | null) => {
+                      if (err) reject(err);
+                      else resolve();
+                    });
+                  };
+
+                  try {
+                    executePlay();
+                  } catch {
+                    conn.player.getStatus((statusErr: Error | null) => {
+                      if (statusErr) {
+                        reject(statusErr);
+                        return;
+                      }
+                      try {
+                        executePlay();
+                      } catch (retryErr) {
+                        reject(retryErr);
+                      }
+                    });
+                  }
+                }),
+                `resumeMedia on ${host}`,
+                5000, // 5s timeout zabrání zamrznutí
+              ),
             catch: (e) =>
               new CastMediaError({
-                message: `resumeMedia on ${host} failed`,
+                message: `resumeMedia on ${host} failed: ${e instanceof Error ? e.message : String(e)}`,
                 cause: e,
               }),
-          });
+          }).pipe(
+            // Pokud spojení spadlo (zombie socket), odstraňme ho z poolu
+            Effect.tapError(() => evict(host, conn.client)),
+          );
         }),
 
       stopMedia: (host) =>
@@ -706,10 +782,36 @@ export const CastClientLive = Layer.scoped(
         Effect.gen(function* () {
           const conn = yield* getPlayer(host);
           yield* Effect.tryPromise({
-            try: () => promisifyVoid((cb) => conn.player.seek(currentTime, cb)),
+            try: () =>
+              new Promise<void>((resolve, reject) => {
+                const executeSeek = () => {
+                  conn.player.seek(currentTime, (err: Error | null) => {
+                    if (err) reject(err);
+                    else resolve();
+                  });
+                };
+
+                try {
+                  // 1. Rychlý pokus (pokud currentSession chybí, throwne to synchronně)
+                  executeSeek();
+                } catch {
+                  // 2. Synchronní fallback: Načteme status pro obnovení session a zkusíme znovu
+                  conn.player.getStatus((statusErr: Error | null) => {
+                    if (statusErr) {
+                      reject(statusErr);
+                      return;
+                    }
+                    try {
+                      executeSeek();
+                    } catch (retryErr) {
+                      reject(retryErr);
+                    }
+                  });
+                }
+              }),
             catch: (e) =>
               new CastMediaError({
-                message: `seekMedia on ${host} failed`,
+                message: `seekMedia on ${host} failed: ${e instanceof Error ? e.message : String(e)}`,
                 cause: e,
               }),
           });
