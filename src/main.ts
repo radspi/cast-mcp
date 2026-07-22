@@ -1,11 +1,24 @@
 #!/usr/bin/env bun
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ManagedRuntime } from "effect";
+import { Layer, Logger, LogLevel, ManagedRuntime } from "effect";
 import { CastClientLive } from "./infra/CastClientLive.ts";
 import { createMcpServer } from "./mcp/server.ts";
 import { startRestServer } from "./rest/server.ts";
 
-const runtime = ManagedRuntime.make(CastClientLive);
+// Nastavíme log level na DEBUG a vynutíme zápis přes console.error (stderr)
+const CustomLogger = Logger.replace(
+  Logger.defaultLogger,
+  Logger.make((options) => {
+    console.error(`[${options.date.toISOString()}] [${options.logLevel.label}] ${options.message}`);
+  }),
+);
+
+const runtime = ManagedRuntime.make(
+  CastClientLive.pipe(
+    Layer.provide(Logger.minimumLogLevel(LogLevel.Debug)),
+    Layer.provide(CustomLogger),
+  ),
+);
 
 const args = process.argv.slice(2);
 const restFlagIndex = args.findIndex((arg) => arg === "--rest" || arg === "--http");
