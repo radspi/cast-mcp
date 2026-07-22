@@ -561,7 +561,7 @@ export const CastClientLive = Layer.scoped(
 
           const conn = yield* getConn(host);
 
-          // 1. Zkusíme použít kešovaný player, pokud existuje a žije
+          // 1. Zkusíme použít kešovaný player, pokud existuje a má platnou mediaSession
           if (conn.player && isPlayerAlive(conn.player)) {
             console.error(
               `[stopMedia] Active player instance found for ${host}. Executing player.stop()`,
@@ -569,11 +569,7 @@ export const CastClientLive = Layer.scoped(
 
             const stopped = yield* Effect.tryPromise({
               try: () => promisifyVoid((cb) => conn.player.stop(cb)),
-              catch: (e) =>
-                new CastMediaError({
-                  message: `stopMedia on ${host} failed: ${e instanceof Error ? e.message : String(e)}`,
-                  cause: e,
-                }),
+              catch: (e) => e,
             }).pipe(
               Effect.map(() => true),
               Effect.catchAll((err) => {
@@ -588,7 +584,7 @@ export const CastClientLive = Layer.scoped(
             }
           }
 
-          // 2. Načteme RAW stav z receiveru bez vracení 'null' do chybového kanálu
+          // 2. Načteme RAW stav receiveru
           console.error(`[stopMedia] Fetching raw receiver status from ${host}...`);
           // biome-ignore lint/suspicious/noExplicitAny: castv2-client raw response
           const status = yield* Effect.tryPromise<any, CastConnectionError>({
@@ -604,7 +600,6 @@ export const CastClientLive = Layer.scoped(
           }).pipe(
             Effect.catchAll((err) => {
               console.error(`[stopMedia] Failed to get receiver status:`, err);
-              // Při chybě načtení statusu pokračujeme s prázdným stavem (úspěšná hodnota undefined)
               return Effect.succeed(undefined);
             }),
           );
@@ -617,7 +612,25 @@ export const CastClientLive = Layer.scoped(
             return;
           }
 
-          // 3. PŘIPOJENÍ přes originální rawApp objekt (obsahuje transportId)
+          // Helper pro natvrdo vypnutí aplikace na receiveru
+          const stopApplicationFallback = (sessionId: string) =>
+            new Promise<void>((resolve, reject) => {
+              console.error(
+                `[stopMedia] Stopping application directly via receiver sessionId: ${sessionId}`,
+              );
+              conn.client.stop(sessionId, (stopErr: Error | null) => {
+                if (stopErr) {
+                  console.error(`[stopMedia] Receiver client.stop() failed:`, stopErr);
+                  reject(stopErr);
+                } else {
+                  console.error(`[stopMedia] Receiver client.stop() succeeded.`);
+                  conn.player = undefined;
+                  resolve();
+                }
+              });
+            });
+
+          // 3. PŘIPOJENÍ k aplikaci (join)
           console.error(
             `[stopMedia] Attempting client.join with transportId: ${rawApp.transportId}`,
           );
@@ -632,35 +645,42 @@ export const CastClientLive = Layer.scoped(
                   (err: Error | null, joinedPlayer: any) => {
                     if (err) {
                       console.error(`[stopMedia] client.join() failed:`, err);
+                      stopApplicationFallback(rawApp.sessionId).then(resolve, reject);
+                      return;
+                    }
+
+                    console.error(
+                      `[stopMedia] Joined session. Fetching media status to populate currentSession...`,
+                    );
+                    attachPlayer(conn, joinedPlayer);
+
+                    // PŘED stopMedia JE NUTNÉ ZAVOLAT getStatus(), aby se v joinedPlayer vytvořil currentSession
+                    // biome-ignore lint/suspicious/noExplicitAny: castv2-client raw response
+                    joinedPlayer.getStatus((statusErr: Error | null, mediaStatus: any) => {
+                      if (statusErr || !joinedPlayer.currentSession) {
+                        console.error(
+                          `[stopMedia] joinedPlayer.getStatus() failed or no media session found. Fallback to client.stop()`,
+                          statusErr,
+                        );
+                        stopApplicationFallback(rawApp.sessionId).then(resolve, reject);
+                        return;
+                      }
+
                       console.error(
-                        `[stopMedia] Fallback to client.stop(sessionId: ${rawApp.sessionId})`,
+                        `[stopMedia] Media status received (mediaSessionId: ${joinedPlayer.currentSession.mediaSessionId}). Executing stop()`,
                       );
 
-                      conn.client.stop(rawApp.sessionId, (stopErr: Error | null) => {
+                      joinedPlayer.stop((stopErr: Error | null) => {
                         if (stopErr) {
-                          console.error(`[stopMedia] Fallback client.stop() failed:`, stopErr);
-                          reject(stopErr);
+                          console.error(`[stopMedia] joinedPlayer.stop() failed:`, stopErr);
+                          // Pokud selže i stop na media channelu, dorazíme to přes receiver stop
+                          stopApplicationFallback(rawApp.sessionId).then(resolve, reject);
                         } else {
-                          console.error(`[stopMedia] Fallback client.stop() succeeded.`);
+                          console.error(`[stopMedia] joinedPlayer.stop() succeeded.`);
                           conn.player = undefined;
                           resolve();
                         }
                       });
-                      return;
-                    }
-
-                    console.error(`[stopMedia] Joined session. Executing joinedPlayer.stop()`);
-                    attachPlayer(conn, joinedPlayer);
-
-                    joinedPlayer.stop((stopErr: Error | null) => {
-                      if (stopErr) {
-                        console.error(`[stopMedia] joinedPlayer.stop() failed:`, stopErr);
-                        reject(stopErr);
-                      } else {
-                        console.error(`[stopMedia] joinedPlayer.stop() succeeded.`);
-                        conn.player = undefined;
-                        resolve();
-                      }
                     });
                   },
                 );
