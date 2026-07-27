@@ -19,7 +19,7 @@ export const discoverDevicesTool = createTool({
   },
   annotations: {
     title: "Discover Cast Devices",
-    readOnlyHint: true,
+    readOnlyHint: false,
     destructiveHint: false,
     idempotentHint: false,
     openWorldHint: true,

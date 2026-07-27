@@ -15,7 +15,7 @@ export const getVolumeTool = createTool({
   },
   annotations: {
     title: "Get Volume",
-    readOnlyHint: true,
+    readOnlyHint: false,
     destructiveHint: false,
     idempotentHint: true,
     openWorldHint: true,

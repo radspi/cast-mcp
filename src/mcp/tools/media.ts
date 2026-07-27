@@ -143,7 +143,7 @@ export const getMediaStatusTool = createTool({
   },
   annotations: {
     title: "Get Media Status",
-    readOnlyHint: true,
+    readOnlyHint: false,
     destructiveHint: false,
     idempotentHint: true,
     openWorldHint: true,

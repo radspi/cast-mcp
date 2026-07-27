@@ -16,7 +16,7 @@ export const getStatusTool = createTool({
   },
   annotations: {
     title: "Get Receiver Status",
-    readOnlyHint: true,
+    readOnlyHint: false,
     destructiveHint: false,
     idempotentHint: true,
     openWorldHint: true,
