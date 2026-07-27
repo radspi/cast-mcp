@@ -18,4 +18,4 @@ services:
     labels:
       - "homepage.group=OpenAPI"
       - "homepage.name=Cast MCP"      
-      - "homepage.href=http://lenovo-server:3334"      
+      - "homepage.href=http://lenovo-server:3334/docs"      
