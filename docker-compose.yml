@@ -15,3 +15,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+    labels:
+      - "homepage.group=OpenAPI"
+      - "homepage.name=Cast MCP"      
+      - "homepage.href=http://lenovo-server:3334"      
