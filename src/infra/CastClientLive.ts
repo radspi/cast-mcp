@@ -428,6 +428,9 @@ export const CastClientLive = Layer.scoped(
                 { txt: Record<string, string>; host: string; port: number }
               >();
 
+              // Mapa pro překlad hostname (např. xxx.local) -> IPv4 adresa
+              const hostToIp = new Map<string, string>();
+
               const timer = setTimeout(() => {
                 mdns.destroy();
                 resolve([...devices.values()]);
@@ -456,6 +459,14 @@ export const CastClientLive = Layer.scoped(
                   // be matched to the correct pending entry.
                   const serviceNameToId = new Map<string, string>();
 
+                  // 1. Nejprve posbíráme A záznamy (IP adresy)
+                  for (const record of all) {
+                    if (record.type === "A" && typeof record.data === "string") {
+                      hostToIp.set(record.name, record.data);
+                    }
+                  }
+
+                  // 2. Zpracujeme TXT a SRV záznamy
                   for (const record of all) {
                     if (record.type === "TXT") {
                       const txt = parseTxt(record.data as Buffer[]);
@@ -471,9 +482,6 @@ export const CastClientLive = Layer.scoped(
                         target: string;
                         port: number;
                       };
-                      // Match this SRV record to its corresponding pending
-                      // entry by service name to avoid assigning the wrong
-                      // host/port on networks with multiple Cast devices.
                       const id = serviceNameToId.get(record.name);
                       const entry = id !== undefined ? pending.get(id) : undefined;
                       if (entry && !entry.host) {
@@ -483,16 +491,20 @@ export const CastClientLive = Layer.scoped(
                     }
                   }
 
-                  // Build devices from fully resolved pending entries
+                  // 3. Build devices (s přednostním použitím IP z hostToIp)
                   for (const [id, p] of pending.entries()) {
                     if (!p.host || devices.has(id)) continue;
+
+                    // Přeložíme host (.local) na IP adresu, pokud ji máme
+                    const resolvedHost = hostToIp.get(p.host) ?? p.host;
+
                     const ca = Number.parseInt(p.txt.ca ?? "0", 10);
                     devices.set(
                       id,
                       new CastDevice({
                         id,
                         name: p.txt.fn ?? id,
-                        host: p.host,
+                        host: resolvedHost, // Nařešená IP adresa
                         port: p.port,
                         type: resolveDeviceType(ca),
                         modelName: p.txt.md ?? "Unknown",
@@ -509,7 +521,6 @@ export const CastClientLive = Layer.scoped(
             }),
           catch: (e) => new CastConnectionError({ host: "mdns", cause: e }),
         }),
-
       getStatus,
 
       playMedia: (host, contentUrl, contentType, metadata) =>
